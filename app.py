@@ -23,16 +23,9 @@ SPREADSHEET_ID = "1hqwp1bvipMTPMiucddGz7_DtkE-dC9TAK4-BoD3yhrM"
 WORKSHEET_GID = 960415359
 DOC_ID = "1cDCIBNhPV37HeFT3Wtl6Dt18iz74mee5NsXbCJeuV5E"
 
-# まずは初回空振りを防ぐため 0 分にする
 DELAY_MINUTES = 0
-
-# データの再取得間隔
 CACHE_TTL_SECONDS = 300
-
-# タイムゾーン
 JST = timezone(timedelta(hours=9))
-
-# 意味検索モデル
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
@@ -140,45 +133,89 @@ def find_worksheet_by_gid(spreadsheet, gid: int):
 
 
 def parse_sheet_rows(values: List[List[Any]]) -> List[Dict[str, Any]]:
+    """
+    シートの列位置がずれていても、行全体を見て Q/A を拾う。
+    想定対応:
+    - どこかのセルに日付
+    - どこかのセルが Q / A
+    - または "Q: ..." / "A: ..." 形式
+    """
     records: List[Dict[str, Any]] = []
 
     current_date = ""
     pending_q = ""
 
+    def row_texts(row: List[Any]) -> List[str]:
+        return [clean_sheet_value(str(x)) for x in row if clean_sheet_value(str(x))]
+
     for row in values:
-        row = list(row) + ["", "", "", "", ""]
-        col0 = clean_sheet_value(row[0])
-        col1 = clean_sheet_value(row[1]).upper()
-        col2 = normalize_text(row[2]).strip()
+        cells = row_texts(list(row))
+        if not cells:
+            continue
 
-        # 日付行
-        if is_date_like(col0):
-            current_date = col0[:10]
+        # 日付をどこかのセルで見つけたら保持
+        found_date = None
+        for cell in cells:
+            if is_date_like(cell):
+                found_date = cell[:10]
+                break
+        if found_date:
+            current_date = found_date
             pending_q = ""
             continue
 
-        # 質問行
-        if col1 in {"Q", "Ｑ"}:
-            pending_q = normalize_text(col2)
-            continue
+        # 行全体を走査して Q / A を探す
+        for i, cell in enumerate(cells):
+            upper = cell.upper()
 
-        # 回答行
-        if col1 in {"A", "Ａ"}:
-            answer = normalize_text(col2)
-            question = normalize_text(pending_q)
+            # パターン1: セル単体が Q / A
+            if upper in {"Q", "Ｑ"}:
+                if i + 1 < len(cells):
+                    pending_q = normalize_text(cells[i + 1])
+                break
 
-            if current_date and question and answer:
-                records.append(
-                    {
-                        "source_type": "sheet",
-                        "source_date": current_date,
-                        "campus": "",
-                        "category": "",
-                        "question": question,
-                        "answer": answer,
-                    }
-                )
-            pending_q = ""
+            if upper in {"A", "Ａ"}:
+                if i + 1 < len(cells):
+                    answer = normalize_text(cells[i + 1])
+                    question = normalize_text(pending_q)
+                    if current_date and question and answer:
+                        records.append(
+                            {
+                                "source_type": "sheet",
+                                "source_date": current_date,
+                                "campus": "",
+                                "category": "",
+                                "question": question,
+                                "answer": answer,
+                            }
+                        )
+                    pending_q = ""
+                break
+
+            # パターン2: "Q: 質問..." 形式
+            q_match = re.match(r"^[QＱ][：:]\s*(.+)$", cell)
+            if q_match:
+                pending_q = normalize_text(q_match.group(1))
+                break
+
+            # パターン3: "A: 回答..." 形式
+            a_match = re.match(r"^[AＡ][：:]\s*(.+)$", cell)
+            if a_match:
+                answer = normalize_text(a_match.group(1))
+                question = normalize_text(pending_q)
+                if current_date and question and answer:
+                    records.append(
+                        {
+                            "source_type": "sheet",
+                            "source_date": current_date,
+                            "campus": "",
+                            "category": "",
+                            "question": question,
+                            "answer": answer,
+                        }
+                    )
+                pending_q = ""
+                break
 
     return dedupe_records(records)
 
@@ -206,6 +243,7 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "modifiedTime": meta["modifiedTime"],
         "eligible": True,
         "reason": "",
+        "raw_preview": values[:20],
     }
 
 
@@ -470,6 +508,13 @@ with st.expander("データ反映状況"):
         st.write(f"取込対象: {'はい' if meta_preview['doc']['eligible'] else 'まだ'}")
         if meta_preview["doc"]["reason"]:
             st.caption(meta_preview["doc"]["reason"])
+
+        st.markdown("**Sheets raw preview（先頭20行）**")
+        raw_preview = meta_preview["sheet"].get("raw_preview", [])
+        if raw_preview:
+            st.dataframe(pd.DataFrame(raw_preview))
+        else:
+            st.write("Sheetsのプレビューを取得できませんでした。")
 
     except Exception as e:
         st.error(f"データ状況の取得に失敗しました: {e}")
