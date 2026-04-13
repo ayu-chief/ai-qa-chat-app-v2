@@ -1,5 +1,8 @@
 streamlit
-scikit-learn
 pandas
-openpyxl
 janome
+scikit-learn
+gspread
+google-auth
+google-api-python-client
+python-dateutil
