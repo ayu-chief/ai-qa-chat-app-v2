@@ -1,1 +1,1 @@
-# ai-qa-chat-app-v2
+# ai-qa-chat-app
