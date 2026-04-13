@@ -145,7 +145,9 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
     想定対応:
     - どこかのセルに日付
     - どこかのセルが Q / A
-    - または "Q: ..." / "A: ..." 形式
+    - "Q: ..." / "A: ..."
+    - "質問" / "回答"
+    - "質問: ..." / "回答: ..."
     """
     records: List[Dict[str, Any]] = []
 
@@ -160,7 +162,6 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
         if not cells:
             continue
 
-        # 日付をどこかのセルで見つけたら保持
         found_date = None
         for cell in cells:
             if is_date_like(cell):
@@ -171,17 +172,16 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
             pending_q = ""
             continue
 
-        # 行全体を走査して Q / A を探す
         for i, cell in enumerate(cells):
             upper = cell.upper()
 
-            # パターン1: セル単体が Q / A
-            if upper in {"Q", "Ｑ"}:
+            # パターン1: セル単体が Q / A / 質問 / 回答
+            if upper in {"Q", "Ｑ", "質問"}:
                 if i + 1 < len(cells):
                     pending_q = normalize_text(cells[i + 1])
                 break
 
-            if upper in {"A", "Ａ"}:
+            if upper in {"A", "Ａ", "回答"}:
                 if i + 1 < len(cells):
                     answer = normalize_text(cells[i + 1])
                     question = normalize_text(pending_q)
@@ -199,16 +199,39 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
                     pending_q = ""
                 break
 
-            # パターン2: "Q: 質問..." 形式
+            # パターン2: "Q: ..." / "A: ..."
             q_match = re.match(r"^[QＱ][：:]\s*(.+)$", cell)
             if q_match:
                 pending_q = normalize_text(q_match.group(1))
                 break
 
-            # パターン3: "A: 回答..." 形式
             a_match = re.match(r"^[AＡ][：:]\s*(.+)$", cell)
             if a_match:
                 answer = normalize_text(a_match.group(1))
+                question = normalize_text(pending_q)
+                if current_date and question and answer:
+                    records.append(
+                        {
+                            "source_type": "sheet",
+                            "source_date": current_date,
+                            "sheet_name": worksheet_title,
+                            "category": "",
+                            "question": question,
+                            "answer": answer,
+                        }
+                    )
+                pending_q = ""
+                break
+
+            # パターン3: "質問: ..." / "回答: ..."
+            q2_match = re.match(r"^質問[：:]\s*(.+)$", cell)
+            if q2_match:
+                pending_q = normalize_text(q2_match.group(1))
+                break
+
+            a2_match = re.match(r"^回答[：:]\s*(.+)$", cell)
+            if a2_match:
+                answer = normalize_text(a2_match.group(1))
                 question = normalize_text(pending_q)
                 if current_date and question and answer:
                     records.append(
@@ -239,6 +262,7 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             "reason": f"最終更新から {DELAY_MINUTES} 分未満のため保留",
             "worksheet_counts": [],
             "raw_preview": [],
+            "all_sheet_previews": {},
         }
 
     gc = get_gspread_client()
@@ -247,12 +271,19 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     all_records: List[Dict[str, Any]] = []
     worksheet_counts: List[Dict[str, Any]] = []
     raw_preview: List[List[Any]] = []
+    all_sheet_previews: Dict[str, List[List[Any]]] = {}
 
-    for idx, ws in enumerate(sh.worksheets()):
+    worksheets = sh.worksheets()
+    batch_ranges = [f"'{ws.title}'" for ws in worksheets]
+
+    batch_values = sh.batch_get(batch_ranges)
+
+    for idx, ws in enumerate(worksheets):
         try:
-            values = ws.get_all_values()
+            values = batch_values[idx] if idx < len(batch_values) else []
             if idx == 0:
                 raw_preview = values[:20]
+            all_sheet_previews[ws.title] = values[:30]
 
             records = parse_sheet_rows(values, worksheet_title=ws.title)
             all_records.extend(records)
@@ -261,6 +292,7 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "sheet_name": ws.title,
                 "row_count": len(values),
                 "qa_count": len(records),
+                "error": None,
             })
         except Exception as e:
             worksheet_counts.append({
@@ -269,6 +301,7 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "qa_count": 0,
                 "error": str(e),
             })
+            all_sheet_previews[ws.title] = []
 
     all_records = dedupe_records(all_records)
 
@@ -279,6 +312,7 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "reason": "",
         "worksheet_counts": worksheet_counts,
         "raw_preview": raw_preview,
+        "all_sheet_previews": all_sheet_previews,
     }
 
 
@@ -362,7 +396,6 @@ def parse_doc_lines(lines: List[str]) -> List[Dict[str, Any]]:
     for line in lines:
         line = normalize_text(line)
 
-        # 校舎見出しは無視
         if re.match(r"^■.+$", line):
             flush()
             continue
@@ -540,7 +573,26 @@ with st.expander("データ反映状況"):
         worksheet_counts = meta_preview["sheet"].get("worksheet_counts", [])
         if worksheet_counts:
             st.markdown("**Sheetsごとの抽出件数**")
-            st.dataframe(pd.DataFrame(worksheet_counts))
+            counts_df = pd.DataFrame(worksheet_counts)
+            st.dataframe(counts_df, use_container_width=True)
+
+            zero_df = counts_df[counts_df["qa_count"] == 0].copy()
+            if not zero_df.empty:
+                st.markdown("**0件シートの中身確認**")
+                zero_sheet_names = zero_df["sheet_name"].tolist()
+                selected_zero_sheet = st.selectbox(
+                    "0件だったシートを選んで先頭30行を表示",
+                    zero_sheet_names,
+                    key="zero_sheet_selector"
+                )
+
+                all_sheet_previews = meta_preview["sheet"].get("all_sheet_previews", {})
+                selected_preview = all_sheet_previews.get(selected_zero_sheet, [])
+                if selected_preview:
+                    st.write(f"選択中シート: {selected_zero_sheet}")
+                    st.dataframe(pd.DataFrame(selected_preview), use_container_width=True)
+                else:
+                    st.write("このシートのプレビューは取得できませんでした。")
 
         st.markdown("**Docs**")
         st.write(f"ファイル名: {meta_preview['doc']['name']}")
@@ -552,7 +604,7 @@ with st.expander("データ反映状況"):
         st.markdown("**Sheets raw preview（先頭シート20行）**")
         raw_preview = meta_preview["sheet"].get("raw_preview", [])
         if raw_preview:
-            st.dataframe(pd.DataFrame(raw_preview))
+            st.dataframe(pd.DataFrame(raw_preview), use_container_width=True)
         else:
             st.write("Sheetsのプレビューを取得できませんでした。")
 
