@@ -17,14 +17,19 @@ from sentence_transformers import SentenceTransformer, util
 # =========================
 st.set_page_config(page_title="白井先生QA集リコメンドチャット v2", layout="centered")
 st.title("白井先生QA集リコメンドチャット v2")
-st.caption("Google Sheets + Google Docs 両対応 / 最終更新から1時間後に反映 / 意味検索対応")
+st.caption("Google Sheets + Google Docs 両対応 / 初回読込対応 / 意味検索対応")
 
 SPREADSHEET_ID = "1hqwp1bvipMTPMiucddGz7_DtkE-dC9TAK4-BoD3yhrM"
 WORKSHEET_GID = 960415359
 DOC_ID = "1cDCIBNhPV37HeFT3Wtl6Dt18iz74mee5NsXbCJeuV5E"
 
-DELAY_MINUTES = 60
+# まずは初回空振りを防ぐため 0 分にする
+DELAY_MINUTES = 0
+
+# データの再取得間隔
 CACHE_TTL_SECONDS = 300
+
+# タイムゾーン
 JST = timezone(timedelta(hours=9))
 
 # 意味検索モデル
@@ -411,7 +416,7 @@ def build_corpus_embeddings(texts: List[str]):
 
 def search_qa(df: pd.DataFrame, user_input: str, top_n: int = 5) -> pd.DataFrame:
     if df.empty:
-        return df
+        return df.iloc[0:0].copy()
 
     texts = build_search_corpus(df)
     corpus_embeddings = build_corpus_embeddings(texts)
@@ -427,6 +432,9 @@ def search_qa(df: pd.DataFrame, user_input: str, top_n: int = 5) -> pd.DataFrame
     )
 
     hits = util.semantic_search(query_embedding, corpus_embeddings, top_k=top_n)[0]
+    if not hits:
+        return df.iloc[0:0].copy()
+
     hit_indices = [hit["corpus_id"] for hit in hits]
     hit_scores = [float(hit["score"]) for hit in hits]
 
@@ -441,11 +449,16 @@ def search_qa(df: pd.DataFrame, user_input: str, top_n: int = 5) -> pd.DataFrame
 if "history" not in st.session_state:
     st.session_state.history = []
 
+# 初回モデル読込を明示
+with st.spinner("検索モデルを準備中です。初回のみ少し時間がかかります..."):
+    load_embedding_model()
+
 col1, col2 = st.columns([1, 1])
 
 with col1:
     if st.button("最新データに更新"):
         st.cache_data.clear()
+        st.cache_resource.clear()
         st.rerun()
 
 with st.expander("データ反映状況"):
@@ -490,7 +503,10 @@ if search_btn and user_input:
         st.session_state.history.append(("ユーザー", user_input))
 
         if result_df.empty:
-            st.session_state.history.append(("AI", "まだ検索対象のQ&Aがありません。"))
+            st.session_state.history.append((
+                "AI",
+                "まだ検索対象のQ&Aがありません。少し待ってから『最新データに更新』を押すか、入力語句を変えて試してください。"
+            ))
         else:
             best = result_df.iloc[0]
             answer_text = (
@@ -542,5 +558,5 @@ else:
 st.markdown("---")
 st.caption(
     "このアプリは Google Sheets と Google Docs からQ&Aを読み込み、"
-    "最終更新から1時間経過したデータのみ検索対象にします。"
+    "意味検索で近い内容を表示します。"
 )
