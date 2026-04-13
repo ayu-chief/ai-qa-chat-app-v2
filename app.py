@@ -98,7 +98,22 @@ def is_date_like(text: str) -> bool:
     text = normalize_text(text)
     if not text:
         return False
-    return bool(re.match(r"^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$", text))
+    return bool(
+        re.match(
+            r"^\d{4}[/-]\d{1,2}[/-]\d{1,2}(?:\s+\d{1,2}:\d{2}:\d{2})?$",
+            text
+        )
+    )
+
+
+def normalize_date_text(text: str) -> str:
+    text = normalize_text(text)
+    text = text.replace("/", "-")
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", text)
+    if m:
+        y, mo, d = m.groups()
+        return f"{y}-{int(mo):02d}-{int(d):02d}"
+    return text[:10]
 
 
 def clean_sheet_value(text: str) -> str:
@@ -157,7 +172,7 @@ def parse_sheet_rows(values: List[List[Any]]) -> List[Dict[str, Any]]:
         found_date = None
         for cell in cells:
             if is_date_like(cell):
-                found_date = cell[:10]
+                found_date = normalize_date_text(cell)
                 break
         if found_date:
             current_date = found_date
