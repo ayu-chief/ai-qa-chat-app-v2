@@ -119,7 +119,6 @@ def dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         key = (
             r.get("source_type", ""),
             r.get("source_date", ""),
-            r.get("campus", ""),
             r.get("question", ""),
             r.get("answer", ""),
         )
@@ -144,44 +143,36 @@ def parse_sheet_rows(values: List[List[Any]]) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
 
     current_date = ""
-    current_campus = ""
     pending_q = ""
 
-    campus_candidates = {
-        "京都", "名古屋", "木更津", "川崎", "尼崎", "盛岡", "湘南台", "町田", "大森", "その他"
-    }
-
     for row in values:
-        row = list(row) + ["", "", ""]
+        row = list(row) + ["", "", "", "", ""]
         col0 = clean_sheet_value(row[0])
-        col1 = clean_sheet_value(row[1])
+        col1 = clean_sheet_value(row[1]).upper()
         col2 = normalize_text(row[2]).strip()
 
+        # 日付行
         if is_date_like(col0):
             current_date = col0[:10]
-            current_campus = ""
             pending_q = ""
             continue
 
-        if col0 in campus_candidates:
-            current_campus = col0
-            pending_q = ""
-            continue
-
-        if col1 == "Q":
+        # 質問行
+        if col1 in {"Q", "Ｑ"}:
             pending_q = normalize_text(col2)
             continue
 
-        if col1 == "A":
+        # 回答行
+        if col1 in {"A", "Ａ"}:
             answer = normalize_text(col2)
             question = normalize_text(pending_q)
 
-            if current_date and current_campus and question and answer:
+            if current_date and question and answer:
                 records.append(
                     {
                         "source_type": "sheet",
                         "source_date": current_date,
-                        "campus": current_campus,
+                        "campus": "",
                         "category": "",
                         "question": question,
                         "answer": answer,
@@ -266,7 +257,6 @@ def parse_doc_lines(lines: List[str]) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
 
     doc_date = ""
-    current_campus = ""
     current_question = ""
     current_category = ""
     answer_parts: List[str] = []
@@ -275,12 +265,12 @@ def parse_doc_lines(lines: List[str]) -> List[Dict[str, Any]]:
         nonlocal current_question, current_category, answer_parts
         q = normalize_text(current_question)
         a = normalize_text(" ".join(answer_parts))
-        if current_campus and q and a:
+        if q and a:
             records.append(
                 {
                     "source_type": "doc",
                     "source_date": doc_date,
-                    "campus": current_campus,
+                    "campus": "",
                     "category": current_category,
                     "question": q,
                     "answer": a,
@@ -299,10 +289,9 @@ def parse_doc_lines(lines: List[str]) -> List[Dict[str, Any]]:
     for line in lines:
         line = normalize_text(line)
 
-        campus_match = re.match(r"^■(.+?)(校)?$", line)
-        if campus_match:
+        # 校舎見出しは無視
+        if re.match(r"^■.+$", line):
             flush()
-            current_campus = campus_match.group(1).strip()
             continue
 
         q_match = re.match(r"^\*?\s*質問(?:①|②|\d+)?[:：]\s*(.+)$", line)
@@ -377,6 +366,8 @@ def load_all_qa() -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "sheet": sheet_meta,
         "doc": doc_meta,
         "count": len(df),
+        "sheet_count": len(sheet_records),
+        "doc_count": len(doc_records),
     }
     return df, meta
 
@@ -396,7 +387,6 @@ def build_search_corpus(df: pd.DataFrame) -> List[str]:
     return (
         df["question"].fillna("") + " " +
         df["answer"].fillna("") + " " +
-        df["campus"].fillna("") + " " +
         df["category"].fillna("")
     ).tolist()
 
@@ -449,7 +439,6 @@ def search_qa(df: pd.DataFrame, user_input: str, top_n: int = 5) -> pd.DataFrame
 if "history" not in st.session_state:
     st.session_state.history = []
 
-# 初回モデル読込を明示
 with st.spinner("検索モデルを準備中です。初回のみ少し時間がかかります..."):
     load_embedding_model()
 
@@ -464,7 +453,9 @@ with col1:
 with st.expander("データ反映状況"):
     try:
         _, meta_preview = load_all_qa()
-        st.write(f"件数: {meta_preview['count']} 件")
+        st.write(f"合計件数: {meta_preview['count']} 件")
+        st.write(f"Sheets抽出件数: {meta_preview['sheet_count']} 件")
+        st.write(f"Docs抽出件数: {meta_preview['doc_count']} 件")
 
         st.markdown("**Sheets**")
         st.write(f"ファイル名: {meta_preview['sheet']['name']}")
@@ -511,7 +502,6 @@ if search_btn and user_input:
             best = result_df.iloc[0]
             answer_text = (
                 f"おすすめQ&A：\n\n"
-                f"**校舎:** {best['campus']}\n\n"
                 f"**質問:** {best['question']}\n\n"
                 f"**回答:** {best['answer']}\n\n"
                 f"**カテゴリ:** {best.get('category', '') or '-'}\n\n"
@@ -533,9 +523,7 @@ if search_btn and user_input:
                 row = result_df.iloc[i]
                 st.markdown(
                     f"""
-- **校舎:** {row['campus']}
-
-  **Q:** {row['question']}
+- **Q:** {row['question']}
 
   **A:** {row['answer']}
 
