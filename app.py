@@ -15,9 +15,9 @@ from sentence_transformers import SentenceTransformer, util
 # =========================
 # 基本設定
 # =========================
-st.set_page_config(page_title="白井先生QA集リコメンドチャット v2", layout="centered")
-st.title("白井先生QA集リコメンドチャット v2")
-st.caption("Google Sheets + Google Docs 両対応 / 全シート読込対応 / 意味検索対応")
+st.set_page_config(page_title="白井先生QA集リコメンドチャット", layout="centered")
+st.title("白井先生QA集リコメンドチャット")
+st.caption("Google Sheets と Google Docs の記録をまとめて検索できます")
 
 SPREADSHEET_ID = "1hqwp1bvipMTPMiucddGz7_DtkE-dC9TAK4-BoD3yhrM"
 DOC_ID = "1cDCIBNhPV37HeFT3Wtl6Dt18iz74mee5NsXbCJeuV5E"
@@ -112,7 +112,6 @@ def normalize_date_text(text: str) -> str:
     if m:
         y, mo, d = m.groups()
         return f"{y}-{int(mo):02d}-{int(d):02d}"
-    # 先頭10文字だけだと 2026-6-3 で崩れることがあるので最後にそのまま返す
     return text
 
 
@@ -144,14 +143,6 @@ def dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List[Dict[str, Any]]:
     """
     シートの列位置や表記ゆれに強めに対応して Q/A を拾う。
-
-    対応パターン例:
-    - 1列目: Q / A, 2列目: 本文
-    - 1列目: 質問 / 回答, 2列目: 本文
-    - 1列目: Q: ... / A: ...
-    - 1列目: 質問: ... / 回答: ...
-    - 1列目: Q京都 / Q名古屋 / Q木更津 ...
-    - 1列目: 京都 / 名古屋 ..., 2列目: 質問文
     """
     records: List[Dict[str, Any]] = []
 
@@ -170,7 +161,6 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
         if not cells:
             continue
 
-        # 日付をどこかのセルで見つけたら保持
         found_date = None
         for cell in cells:
             if is_date_like(cell):
@@ -183,12 +173,9 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
 
         first = cells[0] if len(cells) > 0 else ""
         second = cells[1] if len(cells) > 1 else ""
-
         first_upper = first.upper()
 
-        # ----------------------------
         # 回答行
-        # ----------------------------
         if first_upper in {"A", "Ａ", "回答"}:
             answer = normalize_text(second)
             question = normalize_text(pending_q)
@@ -242,9 +229,7 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
             pending_q = ""
             continue
 
-        # ----------------------------
         # 質問行
-        # ----------------------------
         if first_upper in {"Q", "Ｑ", "質問"} and second:
             pending_q = normalize_text(second)
             continue
@@ -595,64 +580,68 @@ with col1:
         st.cache_resource.clear()
         st.rerun()
 
-with st.expander("データ反映状況"):
-    try:
-        _, meta_preview = load_all_qa()
-        st.write(f"合計件数: {meta_preview['count']} 件")
-        st.write(f"Sheets抽出件数: {meta_preview['sheet_count']} 件")
-        st.write(f"Docs抽出件数: {meta_preview['doc_count']} 件")
+with col2:
+    show_admin = st.checkbox("詳細情報を表示", value=False)
 
-        st.markdown("**Sheets**")
-        st.write(f"ファイル名: {meta_preview['sheet']['name']}")
-        st.write(
-            f"最終更新: {format_jst(parse_google_timestamp(meta_preview['sheet']['modifiedTime']))}"
-        )
-        st.write(f"取込対象: {'はい' if meta_preview['sheet']['eligible'] else 'まだ'}")
-        if meta_preview["sheet"]["reason"]:
-            st.caption(meta_preview["sheet"]["reason"])
+if show_admin:
+    with st.expander("データ反映状況", expanded=True):
+        try:
+            _, meta_preview = load_all_qa()
+            st.write(f"合計件数: {meta_preview['count']} 件")
+            st.write(f"Sheets抽出件数: {meta_preview['sheet_count']} 件")
+            st.write(f"Docs抽出件数: {meta_preview['doc_count']} 件")
 
-        worksheet_counts = meta_preview["sheet"].get("worksheet_counts", [])
-        if worksheet_counts:
-            st.markdown("**Sheetsごとの抽出件数**")
-            counts_df = pd.DataFrame(worksheet_counts)
-            st.dataframe(counts_df, use_container_width=True)
+            st.markdown("**Sheets**")
+            st.write(f"ファイル名: {meta_preview['sheet']['name']}")
+            st.write(
+                f"最終更新: {format_jst(parse_google_timestamp(meta_preview['sheet']['modifiedTime']))}"
+            )
+            st.write(f"取込対象: {'はい' if meta_preview['sheet']['eligible'] else 'まだ'}")
+            if meta_preview["sheet"]["reason"]:
+                st.caption(meta_preview["sheet"]["reason"])
 
-            zero_df = counts_df[counts_df["qa_count"] == 0].copy()
-            if not zero_df.empty:
-                st.markdown("**0件シートの中身確認**")
-                zero_sheet_names = zero_df["sheet_name"].tolist()
-                selected_zero_sheet = st.selectbox(
-                    "0件だったシートを選んで先頭30行を表示",
-                    zero_sheet_names,
-                    key="zero_sheet_selector",
-                )
+            worksheet_counts = meta_preview["sheet"].get("worksheet_counts", [])
+            if worksheet_counts:
+                st.markdown("**Sheetsごとの抽出件数**")
+                counts_df = pd.DataFrame(worksheet_counts)
+                st.dataframe(counts_df, use_container_width=True)
 
-                all_sheet_previews = meta_preview["sheet"].get("all_sheet_previews", {})
-                selected_preview = all_sheet_previews.get(selected_zero_sheet, [])
-                if selected_preview:
-                    st.write(f"選択中シート: {selected_zero_sheet}")
-                    st.dataframe(pd.DataFrame(selected_preview), use_container_width=True)
-                else:
-                    st.write("このシートのプレビューは取得できませんでした。")
+                zero_df = counts_df[counts_df["qa_count"] == 0].copy()
+                if not zero_df.empty:
+                    st.markdown("**0件シートの中身確認**")
+                    zero_sheet_names = zero_df["sheet_name"].tolist()
+                    selected_zero_sheet = st.selectbox(
+                        "0件だったシートを選んで先頭30行を表示",
+                        zero_sheet_names,
+                        key="zero_sheet_selector",
+                    )
 
-        st.markdown("**Docs**")
-        st.write(f"ファイル名: {meta_preview['doc']['name']}")
-        st.write(
-            f"最終更新: {format_jst(parse_google_timestamp(meta_preview['doc']['modifiedTime']))}"
-        )
-        st.write(f"取込対象: {'はい' if meta_preview['doc']['eligible'] else 'まだ'}")
-        if meta_preview["doc"]["reason"]:
-            st.caption(meta_preview["doc"]["reason"])
+                    all_sheet_previews = meta_preview["sheet"].get("all_sheet_previews", {})
+                    selected_preview = all_sheet_previews.get(selected_zero_sheet, [])
+                    if selected_preview:
+                        st.write(f"選択中シート: {selected_zero_sheet}")
+                        st.dataframe(pd.DataFrame(selected_preview), use_container_width=True)
+                    else:
+                        st.write("このシートのプレビューは取得できませんでした。")
 
-        st.markdown("**Sheets raw preview（先頭シート20行）**")
-        raw_preview = meta_preview["sheet"].get("raw_preview", [])
-        if raw_preview:
-            st.dataframe(pd.DataFrame(raw_preview), use_container_width=True)
-        else:
-            st.write("Sheetsのプレビューを取得できませんでした。")
+            st.markdown("**Docs**")
+            st.write(f"ファイル名: {meta_preview['doc']['name']}")
+            st.write(
+                f"最終更新: {format_jst(parse_google_timestamp(meta_preview['doc']['modifiedTime']))}"
+            )
+            st.write(f"取込対象: {'はい' if meta_preview['doc']['eligible'] else 'まだ'}")
+            if meta_preview["doc"]["reason"]:
+                st.caption(meta_preview["doc"]["reason"])
 
-    except Exception as e:
-        st.error(f"データ状況の取得に失敗しました: {e}")
+            st.markdown("**Sheets raw preview（先頭シート20行）**")
+            raw_preview = meta_preview["sheet"].get("raw_preview", [])
+            if raw_preview:
+                st.dataframe(pd.DataFrame(raw_preview), use_container_width=True)
+            else:
+                st.write("Sheetsのプレビューを取得できませんでした。")
+
+        except Exception as e:
+            st.error(f"データ状況の取得に失敗しました: {e}")
 
 with st.form(key="chat_form", clear_on_submit=False):
     user_input = st.text_input("知りたいこと・悩みを入力してください", key="user_input")
@@ -670,7 +659,7 @@ if search_btn and user_input:
     try:
         with st.spinner("検索中..."):
             time.sleep(0.2)
-            df, meta = load_all_qa()
+            df, _meta = load_all_qa()
             result_df = search_qa(df, user_input, top_n=5)
 
         st.session_state.history.append(("ユーザー", user_input))
@@ -728,6 +717,4 @@ else:
             st.markdown(f"🤖 **AI:** {msg}")
 
 st.markdown("---")
-st.caption(
-    "このアプリは Google Sheets と Google Docs からQ&Aを読み込み、意味検索で近い内容を表示します。"
-)
+st.caption("このアプリは Google Sheets と Google Docs からQ&Aを読み込み、意味検索で近い内容を表示します。")
