@@ -59,81 +59,138 @@ def get_docs_service():
 # =========================
 # 共通ユーティリティ
 # =========================
-def parse_google_timestamp(ts: str) -> datetime:
-    dt = date_parser.isoparse(ts)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List[Dict[str, Any]]:
+    """
+    シートの列位置がずれていても、行全体を見て Q/A を拾う。
+    対応したい形式:
+    - Q / A
+    - Q: ... / A: ...
+    - 質問 / 回答
+    - 質問: ... / 回答: ...
+    - Q京都 / Q名古屋 など（Qの後ろに校舎名）
+    - 校舎名だけが1列目にあり、2列目に質問文
+    """
+    records: List[Dict[str, Any]] = []
 
+    current_date = ""
+    pending_q = ""
 
-def format_jst(dt: Optional[datetime]) -> str:
-    if not dt:
-        return "-"
-    return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M")
+    known_labels = {
+        "京都", "名古屋", "木更津", "川崎", "尼崎", "盛岡", "湘南台", "町田", "大森", "その他"
+    }
 
+    def row_texts(row: List[Any]) -> List[str]:
+        return [clean_sheet_value(str(x)) for x in row if clean_sheet_value(str(x))]
 
-def get_drive_file_metadata(file_id: str) -> Dict[str, Any]:
-    drive = get_drive_service()
-    return (
-        drive.files()
-        .get(fileId=file_id, fields="id,name,mimeType,modifiedTime")
-        .execute()
-    )
-
-
-def is_eligible_by_delay(modified_time_str: str, delay_minutes: int = DELAY_MINUTES) -> bool:
-    modified_dt = parse_google_timestamp(modified_time_str)
-    now = datetime.now(timezone.utc)
-    return now >= (modified_dt + timedelta(minutes=delay_minutes))
-
-
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).replace("\u3000", " ").strip()
-
-
-def is_date_like(text: str) -> bool:
-    text = normalize_text(text)
-    if not text:
-        return False
-    return bool(
-        re.match(
-            r"^\d{4}[/-]\d{1,2}[/-]\d{1,2}(?:\s+\d{1,2}:\d{2}:\d{2})?$",
-            text
-        )
-    )
-
-
-def normalize_date_text(text: str) -> str:
-    text = normalize_text(text)
-    text = text.replace("/", "-")
-    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", text)
-    if m:
-        y, mo, d = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
-    return text[:10]
-
-
-def clean_sheet_value(text: str) -> str:
-    return re.sub(r"\s+", " ", normalize_text(text)).strip()
-
-
-def dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    unique = []
-    for r in records:
-        key = (
-            r.get("source_type", ""),
-            r.get("source_date", ""),
-            r.get("question", ""),
-            r.get("answer", ""),
-        )
-        if key in seen:
+    for row in values:
+        cells = row_texts(list(row))
+        if not cells:
             continue
-        seen.add(key)
-        unique.append(r)
-    return unique
+
+        # 日付をどこかのセルで見つけたら保持
+        found_date = None
+        for cell in cells:
+            if is_date_like(cell):
+                found_date = normalize_date_text(cell)
+                break
+        if found_date:
+            current_date = found_date
+            pending_q = ""
+            continue
+
+        first = cells[0] if len(cells) > 0 else ""
+        second = cells[1] if len(cells) > 1 else ""
+
+        first_upper = first.upper()
+
+        # --------------------------------
+        # 1) 回答行
+        # --------------------------------
+        if first_upper in {"A", "Ａ", "回答"}:
+            answer = normalize_text(second)
+            question = normalize_text(pending_q)
+            if current_date and question and answer:
+                records.append(
+                    {
+                        "source_type": "sheet",
+                        "source_date": current_date,
+                        "sheet_name": worksheet_title,
+                        "category": "",
+                        "question": question,
+                        "answer": answer,
+                    }
+                )
+            pending_q = ""
+            continue
+
+        a_match = re.match(r"^[AＡ][：:]\s*(.+)$", first)
+        if a_match:
+            answer = normalize_text(a_match.group(1))
+            question = normalize_text(pending_q)
+            if current_date and question and answer:
+                records.append(
+                    {
+                        "source_type": "sheet",
+                        "source_date": current_date,
+                        "sheet_name": worksheet_title,
+                        "category": "",
+                        "question": question,
+                        "answer": answer,
+                    }
+                )
+            pending_q = ""
+            continue
+
+        a2_match = re.match(r"^回答[：:]\s*(.+)$", first)
+        if a2_match:
+            answer = normalize_text(a2_match.group(1))
+            question = normalize_text(pending_q)
+            if current_date and question and answer:
+                records.append(
+                    {
+                        "source_type": "sheet",
+                        "source_date": current_date,
+                        "sheet_name": worksheet_title,
+                        "category": "",
+                        "question": question,
+                        "answer": answer,
+                    }
+                )
+            pending_q = ""
+            continue
+
+        # --------------------------------
+        # 2) 質問行
+        # --------------------------------
+        # Q / 質問
+        if first_upper in {"Q", "Ｑ", "質問"} and second:
+            pending_q = normalize_text(second)
+            continue
+
+        # Q: ...
+        q_match = re.match(r"^[QＱ][：:]\s*(.+)$", first)
+        if q_match:
+            pending_q = normalize_text(q_match.group(1))
+            continue
+
+        # 質問: ...
+        q2_match = re.match(r"^質問[：:]\s*(.+)$", first)
+        if q2_match:
+            pending_q = normalize_text(q2_match.group(1))
+            continue
+
+        # Q京都 / Q名古屋 / Q木更津 など
+        q_branch_match = re.match(r"^[QＱ]\s*.+$", first)
+        if q_branch_match and second:
+            pending_q = normalize_text(second)
+            continue
+
+        # 京都 / 名古屋 / 川崎 など校舎名だけがあり、2列目に本文がある
+        if first in known_labels and second:
+            pending_q = normalize_text(second)
+            continue
+
+    return dedupe_records(records)
 
 
 # =========================
