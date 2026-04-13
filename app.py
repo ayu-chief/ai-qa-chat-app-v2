@@ -59,16 +59,99 @@ def get_docs_service():
 # =========================
 # 共通ユーティリティ
 # =========================
+def parse_google_timestamp(ts: str) -> datetime:
+    dt = date_parser.isoparse(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def format_jst(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "-"
+    return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M")
+
+
+def get_drive_file_metadata(file_id: str) -> Dict[str, Any]:
+    drive = get_drive_service()
+    return (
+        drive.files()
+        .get(fileId=file_id, fields="id,name,mimeType,modifiedTime")
+        .execute()
+    )
+
+
+def is_eligible_by_delay(modified_time_str: str, delay_minutes: int = DELAY_MINUTES) -> bool:
+    modified_dt = parse_google_timestamp(modified_time_str)
+    now = datetime.now(timezone.utc)
+    return now >= (modified_dt + timedelta(minutes=delay_minutes))
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\u3000", " ").strip()
+
+
+def is_date_like(text: str) -> bool:
+    text = normalize_text(text)
+    if not text:
+        return False
+    return bool(
+        re.match(
+            r"^\d{4}[/-]\d{1,2}[/-]\d{1,2}(?:\s+\d{1,2}:\d{2}:\d{2})?$",
+            text
+        )
+    )
+
+
+def normalize_date_text(text: str) -> str:
+    text = normalize_text(text)
+    text = text.replace("/", "-")
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", text)
+    if m:
+        y, mo, d = m.groups()
+        return f"{y}-{int(mo):02d}-{int(d):02d}"
+    # 先頭10文字だけだと 2026-6-3 で崩れることがあるので最後にそのまま返す
+    return text
+
+
+def clean_sheet_value(text: str) -> str:
+    return re.sub(r"\s+", " ", normalize_text(text)).strip()
+
+
+def dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    unique = []
+    for r in records:
+        key = (
+            r.get("source_type", ""),
+            r.get("source_date", ""),
+            r.get("sheet_name", ""),
+            r.get("question", ""),
+            r.get("answer", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    return unique
+
+
+# =========================
+# Sheets 読み込み
+# =========================
 def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List[Dict[str, Any]]:
     """
-    シートの列位置がずれていても、行全体を見て Q/A を拾う。
-    対応したい形式:
-    - Q / A
-    - Q: ... / A: ...
-    - 質問 / 回答
-    - 質問: ... / 回答: ...
-    - Q京都 / Q名古屋 など（Qの後ろに校舎名）
-    - 校舎名だけが1列目にあり、2列目に質問文
+    シートの列位置や表記ゆれに強めに対応して Q/A を拾う。
+
+    対応パターン例:
+    - 1列目: Q / A, 2列目: 本文
+    - 1列目: 質問 / 回答, 2列目: 本文
+    - 1列目: Q: ... / A: ...
+    - 1列目: 質問: ... / 回答: ...
+    - 1列目: Q京都 / Q名古屋 / Q木更津 ...
+    - 1列目: 京都 / 名古屋 ..., 2列目: 質問文
     """
     records: List[Dict[str, Any]] = []
 
@@ -103,9 +186,9 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
 
         first_upper = first.upper()
 
-        # --------------------------------
-        # 1) 回答行
-        # --------------------------------
+        # ----------------------------
+        # 回答行
+        # ----------------------------
         if first_upper in {"A", "Ａ", "回答"}:
             answer = normalize_text(second)
             question = normalize_text(pending_q)
@@ -159,147 +242,33 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
             pending_q = ""
             continue
 
-        # --------------------------------
-        # 2) 質問行
-        # --------------------------------
-        # Q / 質問
+        # ----------------------------
+        # 質問行
+        # ----------------------------
         if first_upper in {"Q", "Ｑ", "質問"} and second:
             pending_q = normalize_text(second)
             continue
 
-        # Q: ...
         q_match = re.match(r"^[QＱ][：:]\s*(.+)$", first)
         if q_match:
             pending_q = normalize_text(q_match.group(1))
             continue
 
-        # 質問: ...
         q2_match = re.match(r"^質問[：:]\s*(.+)$", first)
         if q2_match:
             pending_q = normalize_text(q2_match.group(1))
             continue
 
-        # Q京都 / Q名古屋 / Q木更津 など
+        # Q京都 / Q名古屋 / ...
         q_branch_match = re.match(r"^[QＱ]\s*.+$", first)
         if q_branch_match and second:
             pending_q = normalize_text(second)
             continue
 
-        # 京都 / 名古屋 / 川崎 など校舎名だけがあり、2列目に本文がある
+        # 京都 / 名古屋 / ... + 2列目本文
         if first in known_labels and second:
             pending_q = normalize_text(second)
             continue
-
-    return dedupe_records(records)
-
-
-# =========================
-# Sheets 読み込み
-# =========================
-def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List[Dict[str, Any]]:
-    """
-    シートの列位置がずれていても、行全体を見て Q/A を拾う。
-    想定対応:
-    - どこかのセルに日付
-    - どこかのセルが Q / A
-    - "Q: ..." / "A: ..."
-    - "質問" / "回答"
-    - "質問: ..." / "回答: ..."
-    """
-    records: List[Dict[str, Any]] = []
-
-    current_date = ""
-    pending_q = ""
-
-    def row_texts(row: List[Any]) -> List[str]:
-        return [clean_sheet_value(str(x)) for x in row if clean_sheet_value(str(x))]
-
-    for row in values:
-        cells = row_texts(list(row))
-        if not cells:
-            continue
-
-        found_date = None
-        for cell in cells:
-            if is_date_like(cell):
-                found_date = normalize_date_text(cell)
-                break
-        if found_date:
-            current_date = found_date
-            pending_q = ""
-            continue
-
-        for i, cell in enumerate(cells):
-            upper = cell.upper()
-
-            if upper in {"Q", "Ｑ", "質問"}:
-                if i + 1 < len(cells):
-                    pending_q = normalize_text(cells[i + 1])
-                break
-
-            if upper in {"A", "Ａ", "回答"}:
-                if i + 1 < len(cells):
-                    answer = normalize_text(cells[i + 1])
-                    question = normalize_text(pending_q)
-                    if current_date and question and answer:
-                        records.append(
-                            {
-                                "source_type": "sheet",
-                                "source_date": current_date,
-                                "sheet_name": worksheet_title,
-                                "category": "",
-                                "question": question,
-                                "answer": answer,
-                            }
-                        )
-                    pending_q = ""
-                break
-
-            q_match = re.match(r"^[QＱ][：:]\s*(.+)$", cell)
-            if q_match:
-                pending_q = normalize_text(q_match.group(1))
-                break
-
-            a_match = re.match(r"^[AＡ][：:]\s*(.+)$", cell)
-            if a_match:
-                answer = normalize_text(a_match.group(1))
-                question = normalize_text(pending_q)
-                if current_date and question and answer:
-                    records.append(
-                        {
-                            "source_type": "sheet",
-                            "source_date": current_date,
-                            "sheet_name": worksheet_title,
-                            "category": "",
-                            "question": question,
-                            "answer": answer,
-                        }
-                    )
-                pending_q = ""
-                break
-
-            q2_match = re.match(r"^質問[：:]\s*(.+)$", cell)
-            if q2_match:
-                pending_q = normalize_text(q2_match.group(1))
-                break
-
-            a2_match = re.match(r"^回答[：:]\s*(.+)$", cell)
-            if a2_match:
-                answer = normalize_text(a2_match.group(1))
-                question = normalize_text(pending_q)
-                if current_date and question and answer:
-                    records.append(
-                        {
-                            "source_type": "sheet",
-                            "source_date": current_date,
-                            "sheet_name": worksheet_title,
-                            "category": "",
-                            "question": question,
-                            "answer": answer,
-                        }
-                    )
-                pending_q = ""
-                break
 
     return dedupe_records(records)
 
@@ -346,20 +315,24 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             records = parse_sheet_rows(values, worksheet_title=ws.title)
             all_records.extend(records)
 
-            worksheet_counts.append({
-                "sheet_name": ws.title,
-                "row_count": len(values),
-                "qa_count": len(records),
-                "error": None,
-            })
+            worksheet_counts.append(
+                {
+                    "sheet_name": ws.title,
+                    "row_count": len(values),
+                    "qa_count": len(records),
+                    "error": None,
+                }
+            )
 
         except Exception as e:
-            worksheet_counts.append({
-                "sheet_name": ws.title,
-                "row_count": 0,
-                "qa_count": 0,
-                "error": str(e),
-            })
+            worksheet_counts.append(
+                {
+                    "sheet_name": ws.title,
+                    "row_count": 0,
+                    "qa_count": 0,
+                    "error": str(e),
+                }
+            )
             all_sheet_previews[ws.title] = []
 
     all_records = dedupe_records(all_records)
@@ -521,9 +494,16 @@ def load_all_qa() -> Tuple[pd.DataFrame, Dict[str, Any]]:
     df = pd.DataFrame(all_records)
 
     if df.empty:
-        df = pd.DataFrame(columns=[
-            "source_type", "source_date", "sheet_name", "category", "question", "answer"
-        ])
+        df = pd.DataFrame(
+            columns=[
+                "source_type",
+                "source_date",
+                "sheet_name",
+                "category",
+                "question",
+                "answer",
+            ]
+        )
     else:
         df = df.dropna(subset=["question", "answer"]).reset_index(drop=True)
 
@@ -550,9 +530,9 @@ def build_search_corpus(df: pd.DataFrame) -> List[str]:
     if df.empty:
         return []
     return (
-        df["question"].fillna("") + " " +
-        df["answer"].fillna("") + " " +
-        df["category"].fillna("")
+        df["question"].fillna("") + " "
+        + df["answer"].fillna("") + " "
+        + df["category"].fillna("")
     ).tolist()
 
 
@@ -624,7 +604,9 @@ with st.expander("データ反映状況"):
 
         st.markdown("**Sheets**")
         st.write(f"ファイル名: {meta_preview['sheet']['name']}")
-        st.write(f"最終更新: {format_jst(parse_google_timestamp(meta_preview['sheet']['modifiedTime']))}")
+        st.write(
+            f"最終更新: {format_jst(parse_google_timestamp(meta_preview['sheet']['modifiedTime']))}"
+        )
         st.write(f"取込対象: {'はい' if meta_preview['sheet']['eligible'] else 'まだ'}")
         if meta_preview["sheet"]["reason"]:
             st.caption(meta_preview["sheet"]["reason"])
@@ -642,7 +624,7 @@ with st.expander("データ反映状況"):
                 selected_zero_sheet = st.selectbox(
                     "0件だったシートを選んで先頭30行を表示",
                     zero_sheet_names,
-                    key="zero_sheet_selector"
+                    key="zero_sheet_selector",
                 )
 
                 all_sheet_previews = meta_preview["sheet"].get("all_sheet_previews", {})
@@ -655,7 +637,9 @@ with st.expander("データ反映状況"):
 
         st.markdown("**Docs**")
         st.write(f"ファイル名: {meta_preview['doc']['name']}")
-        st.write(f"最終更新: {format_jst(parse_google_timestamp(meta_preview['doc']['modifiedTime']))}")
+        st.write(
+            f"最終更新: {format_jst(parse_google_timestamp(meta_preview['doc']['modifiedTime']))}"
+        )
         st.write(f"取込対象: {'はい' if meta_preview['doc']['eligible'] else 'まだ'}")
         if meta_preview["doc"]["reason"]:
             st.caption(meta_preview["doc"]["reason"])
@@ -672,12 +656,14 @@ with st.expander("データ反映状況"):
 
 with st.form(key="chat_form", clear_on_submit=False):
     user_input = st.text_input("知りたいこと・悩みを入力してください", key="user_input")
-    st.markdown("""
+    st.markdown(
+        """
 ##### 入力例
 - 例1：「不登校」
 - 例2：「友人とのトラブルがあったときの対応は？」
 - 例3：「保護者対応で境界線をどう引く？」
-    """)
+        """
+    )
     search_btn = st.form_submit_button("検索")
 
 if search_btn and user_input:
@@ -690,10 +676,12 @@ if search_btn and user_input:
         st.session_state.history.append(("ユーザー", user_input))
 
         if result_df.empty:
-            st.session_state.history.append((
-                "AI",
-                "まだ検索対象のQ&Aがありません。少し待ってから『最新データに更新』を押すか、入力語句を変えて試してください。"
-            ))
+            st.session_state.history.append(
+                (
+                    "AI",
+                    "まだ検索対象のQ&Aがありません。少し待ってから『最新データに更新』を押すか、入力語句を変えて試してください。",
+                )
+            )
         else:
             best = result_df.iloc[0]
             answer_text = (
@@ -741,6 +729,5 @@ else:
 
 st.markdown("---")
 st.caption(
-    "このアプリは Google Sheets と Google Docs からQ&Aを読み込み、"
-    "意味検索で近い内容を表示します。"
+    "このアプリは Google Sheets と Google Docs からQ&Aを読み込み、意味検索で近い内容を表示します。"
 )
