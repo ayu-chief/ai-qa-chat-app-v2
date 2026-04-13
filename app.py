@@ -175,7 +175,6 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
         for i, cell in enumerate(cells):
             upper = cell.upper()
 
-            # パターン1: セル単体が Q / A / 質問 / 回答
             if upper in {"Q", "Ｑ", "質問"}:
                 if i + 1 < len(cells):
                     pending_q = normalize_text(cells[i + 1])
@@ -199,7 +198,6 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
                     pending_q = ""
                 break
 
-            # パターン2: "Q: ..." / "A: ..."
             q_match = re.match(r"^[QＱ][：:]\s*(.+)$", cell)
             if q_match:
                 pending_q = normalize_text(q_match.group(1))
@@ -223,7 +221,6 @@ def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List
                 pending_q = ""
                 break
 
-            # パターン3: "質問: ..." / "回答: ..."
             q2_match = re.match(r"^質問[：:]\s*(.+)$", cell)
             if q2_match:
                 pending_q = normalize_text(q2_match.group(1))
@@ -274,15 +271,19 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     all_sheet_previews: Dict[str, List[List[Any]]] = {}
 
     worksheets = sh.worksheets()
-    batch_ranges = [f"'{ws.title}'" for ws in worksheets]
+    batch_ranges = [f"'{ws.title}'!A:Z" for ws in worksheets]
 
-    batch_values = sh.batch_get(batch_ranges)
+    batch_response = sh.values_batch_get(batch_ranges)
+    value_ranges = batch_response.get("valueRanges", [])
 
     for idx, ws in enumerate(worksheets):
         try:
-            values = batch_values[idx] if idx < len(batch_values) else []
+            vr = value_ranges[idx] if idx < len(value_ranges) else {}
+            values = vr.get("values", [])
+
             if idx == 0:
                 raw_preview = values[:20]
+
             all_sheet_previews[ws.title] = values[:30]
 
             records = parse_sheet_rows(values, worksheet_title=ws.title)
@@ -294,6 +295,7 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "qa_count": len(records),
                 "error": None,
             })
+
         except Exception as e:
             worksheet_counts.append({
                 "sheet_name": ws.title,
