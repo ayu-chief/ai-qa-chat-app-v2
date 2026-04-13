@@ -7,3 +7,4 @@ google-auth
 google-api-python-client
 python-dateutil
 sentence-transformers
+torch
