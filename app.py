@@ -9,9 +9,7 @@ import streamlit as st
 from dateutil import parser as date_parser
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from janome.tokenizer import Tokenizer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer, util
 
 
 # =========================
@@ -19,20 +17,18 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================
 st.set_page_config(page_title="白井先生QA集リコメンドチャット v2", layout="centered")
 st.title("白井先生QA集リコメンドチャット v2")
-st.caption("Google Sheets + Google Docs 両対応 / 最終更新から1時間後に反映")
+st.caption("Google Sheets + Google Docs 両対応 / 最終更新から1時間後に反映 / 意味検索対応")
 
 SPREADSHEET_ID = "1hqwp1bvipMTPMiucddGz7_DtkE-dC9TAK4-BoD3yhrM"
 WORKSHEET_GID = 960415359
 DOC_ID = "1cDCIBNhPV37HeFT3Wtl6Dt18iz74mee5NsXbCJeuV5E"
 
-# 最終更新から何分後に取り込むか
 DELAY_MINUTES = 60
-
-# キャッシュ時間
 CACHE_TTL_SECONDS = 300
-
-# タイムゾーン
 JST = timezone(timedelta(hours=9))
+
+# 意味検索モデル
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 # =========================
@@ -140,12 +136,6 @@ def find_worksheet_by_gid(spreadsheet, gid: int):
 
 
 def parse_sheet_rows(values: List[List[Any]]) -> List[Dict[str, Any]]:
-    """
-    想定形式:
-    - 1列目に日付行
-    - その下に校舎名行
-    - 同じ校舎ブロックの中で 2列目='Q' / 'A' の行が続く
-    """
     records: List[Dict[str, Any]] = []
 
     current_date = ""
@@ -268,15 +258,6 @@ def extract_doc_lines(doc: Dict[str, Any]) -> List[str]:
 
 
 def parse_doc_lines(lines: List[str]) -> List[Dict[str, Any]]:
-    """
-    想定する Docs 形式:
-    ■京都校
-    * 質問：...
-    * カテゴリ：...
-    * 回答の要点：...
-      * ...
-      * ...
-    """
     records: List[Dict[str, Any]] = []
 
     doc_date = ""
@@ -316,8 +297,7 @@ def parse_doc_lines(lines: List[str]) -> List[Dict[str, Any]]:
         campus_match = re.match(r"^■(.+?)(校)?$", line)
         if campus_match:
             flush()
-            campus_name = campus_match.group(1).strip()
-            current_campus = campus_name
+            current_campus = campus_match.group(1).strip()
             continue
 
         q_match = re.match(r"^\*?\s*質問(?:①|②|\d+)?[:：]\s*(.+)$", line)
@@ -358,11 +338,7 @@ def load_doc_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         }
 
     docs = get_docs_service()
-    doc = (
-        docs.documents()
-        .get(documentId=DOC_ID, includeTabsContent=True)
-        .execute()
-    )
+    doc = docs.documents().get(documentId=DOC_ID, includeTabsContent=True).execute()
     lines = extract_doc_lines(doc)
     records = parse_doc_lines(lines)
 
@@ -401,34 +377,62 @@ def load_all_qa() -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
 
 # =========================
-# 検索
+# 意味検索
 # =========================
-tokenizer = Tokenizer(wakati=True)
+@st.cache_resource
+def load_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(EMBED_MODEL_NAME)
 
 
-def tokenize(text: str) -> List[str]:
-    return list(tokenizer.tokenize(str(text)))
-
-
-def search_qa(df: pd.DataFrame, user_input: str, top_n: int = 5) -> pd.DataFrame:
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def build_search_corpus(df: pd.DataFrame) -> List[str]:
     if df.empty:
-        return df
-
-    corpus = (
+        return []
+    return (
         df["question"].fillna("") + " " +
         df["answer"].fillna("") + " " +
         df["campus"].fillna("") + " " +
         df["category"].fillna("")
     ).tolist()
 
-    tfidf = TfidfVectorizer(tokenizer=tokenize)
-    tfidf_matrix = tfidf.fit_transform(corpus + [user_input])
-    sims = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1]).flatten()
-    top_idx = sims.argsort()[-top_n:][::-1]
 
-    result = df.iloc[top_idx].copy()
-    result["score"] = sims[top_idx]
-    return result.reset_index(drop=True)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def build_corpus_embeddings(texts: List[str]):
+    if not texts:
+        return None
+    model = load_embedding_model()
+    return model.encode(
+        texts,
+        convert_to_tensor=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+
+def search_qa(df: pd.DataFrame, user_input: str, top_n: int = 5) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    texts = build_search_corpus(df)
+    corpus_embeddings = build_corpus_embeddings(texts)
+    if corpus_embeddings is None:
+        return df.iloc[0:0].copy()
+
+    model = load_embedding_model()
+    query_embedding = model.encode(
+        [user_input],
+        convert_to_tensor=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+    hits = util.semantic_search(query_embedding, corpus_embeddings, top_k=top_n)[0]
+    hit_indices = [hit["corpus_id"] for hit in hits]
+    hit_scores = [float(hit["score"]) for hit in hits]
+
+    result = df.iloc[hit_indices].copy().reset_index(drop=True)
+    result["score"] = hit_scores
+    return result
 
 
 # =========================
@@ -479,7 +483,7 @@ with st.form(key="chat_form", clear_on_submit=False):
 if search_btn and user_input:
     try:
         with st.spinner("検索中..."):
-            time.sleep(0.3)
+            time.sleep(0.2)
             df, meta = load_all_qa()
             result_df = search_qa(df, user_input, top_n=5)
 
@@ -495,7 +499,8 @@ if search_btn and user_input:
                 f"**質問:** {best['question']}\n\n"
                 f"**回答:** {best['answer']}\n\n"
                 f"**カテゴリ:** {best.get('category', '') or '-'}\n\n"
-                f"**出典:** {best['source_type']} / {best.get('source_date', '-')}"
+                f"**出典:** {best['source_type']} / {best.get('source_date', '-')}\n\n"
+                f"**類似度:** {best['score']:.3f}"
             )
             st.session_state.history.append(("AI", answer_text))
 
@@ -519,7 +524,8 @@ if search_btn and user_input:
   **A:** {row['answer']}
 
   **カテゴリ:** {row.get('category', '') or '-'}  
-  **出典:** {row['source_type']} / {row.get('source_date', '-')}
+  **出典:** {row['source_type']} / {row.get('source_date', '-')}  
+  **類似度:** {row['score']:.3f}
                     """
                 )
 
