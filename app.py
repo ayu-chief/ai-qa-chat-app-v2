@@ -17,10 +17,9 @@ from sentence_transformers import SentenceTransformer, util
 # =========================
 st.set_page_config(page_title="白井先生QA集リコメンドチャット v2", layout="centered")
 st.title("白井先生QA集リコメンドチャット v2")
-st.caption("Google Sheets + Google Docs 両対応 / 初回読込対応 / 意味検索対応")
+st.caption("Google Sheets + Google Docs 両対応 / 全シート読込対応 / 意味検索対応")
 
 SPREADSHEET_ID = "1hqwp1bvipMTPMiucddGz7_DtkE-dC9TAK4-BoD3yhrM"
-WORKSHEET_GID = 960415359
 DOC_ID = "1cDCIBNhPV37HeFT3Wtl6Dt18iz74mee5NsXbCJeuV5E"
 
 DELAY_MINUTES = 0
@@ -140,14 +139,7 @@ def dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # =========================
 # Sheets 読み込み
 # =========================
-def find_worksheet_by_gid(spreadsheet, gid: int):
-    for ws in spreadsheet.worksheets():
-        if getattr(ws, "id", None) == gid:
-            return ws
-    raise ValueError(f"gid={gid} のワークシートが見つかりません。")
-
-
-def parse_sheet_rows(values: List[List[Any]]) -> List[Dict[str, Any]]:
+def parse_sheet_rows(values: List[List[Any]], worksheet_title: str = "") -> List[Dict[str, Any]]:
     """
     シートの列位置がずれていても、行全体を見て Q/A を拾う。
     想定対応:
@@ -198,7 +190,7 @@ def parse_sheet_rows(values: List[List[Any]]) -> List[Dict[str, Any]]:
                             {
                                 "source_type": "sheet",
                                 "source_date": current_date,
-                                "campus": "",
+                                "sheet_name": worksheet_title,
                                 "category": "",
                                 "question": question,
                                 "answer": answer,
@@ -223,7 +215,7 @@ def parse_sheet_rows(values: List[List[Any]]) -> List[Dict[str, Any]]:
                         {
                             "source_type": "sheet",
                             "source_date": current_date,
-                            "campus": "",
+                            "sheet_name": worksheet_title,
                             "category": "",
                             "question": question,
                             "answer": answer,
@@ -245,20 +237,48 @@ def load_sheet_records() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             "modifiedTime": meta["modifiedTime"],
             "eligible": False,
             "reason": f"最終更新から {DELAY_MINUTES} 分未満のため保留",
+            "worksheet_counts": [],
+            "raw_preview": [],
         }
 
     gc = get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
-    ws = find_worksheet_by_gid(sh, WORKSHEET_GID)
-    values = ws.get_all_values()
-    records = parse_sheet_rows(values)
 
-    return records, {
+    all_records: List[Dict[str, Any]] = []
+    worksheet_counts: List[Dict[str, Any]] = []
+    raw_preview: List[List[Any]] = []
+
+    for idx, ws in enumerate(sh.worksheets()):
+        try:
+            values = ws.get_all_values()
+            if idx == 0:
+                raw_preview = values[:20]
+
+            records = parse_sheet_rows(values, worksheet_title=ws.title)
+            all_records.extend(records)
+
+            worksheet_counts.append({
+                "sheet_name": ws.title,
+                "row_count": len(values),
+                "qa_count": len(records),
+            })
+        except Exception as e:
+            worksheet_counts.append({
+                "sheet_name": ws.title,
+                "row_count": 0,
+                "qa_count": 0,
+                "error": str(e),
+            })
+
+    all_records = dedupe_records(all_records)
+
+    return all_records, {
         "name": meta.get("name", "Sheets"),
         "modifiedTime": meta["modifiedTime"],
         "eligible": True,
         "reason": "",
-        "raw_preview": values[:20],
+        "worksheet_counts": worksheet_counts,
+        "raw_preview": raw_preview,
     }
 
 
@@ -323,7 +343,7 @@ def parse_doc_lines(lines: List[str]) -> List[Dict[str, Any]]:
                 {
                     "source_type": "doc",
                     "source_date": doc_date,
-                    "campus": "",
+                    "sheet_name": "",
                     "category": current_category,
                     "question": q,
                     "answer": a,
@@ -410,7 +430,7 @@ def load_all_qa() -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     if df.empty:
         df = pd.DataFrame(columns=[
-            "source_type", "source_date", "campus", "category", "question", "answer"
+            "source_type", "source_date", "sheet_name", "category", "question", "answer"
         ])
     else:
         df = df.dropna(subset=["question", "answer"]).reset_index(drop=True)
@@ -517,6 +537,11 @@ with st.expander("データ反映状況"):
         if meta_preview["sheet"]["reason"]:
             st.caption(meta_preview["sheet"]["reason"])
 
+        worksheet_counts = meta_preview["sheet"].get("worksheet_counts", [])
+        if worksheet_counts:
+            st.markdown("**Sheetsごとの抽出件数**")
+            st.dataframe(pd.DataFrame(worksheet_counts))
+
         st.markdown("**Docs**")
         st.write(f"ファイル名: {meta_preview['doc']['name']}")
         st.write(f"最終更新: {format_jst(parse_google_timestamp(meta_preview['doc']['modifiedTime']))}")
@@ -524,7 +549,7 @@ with st.expander("データ反映状況"):
         if meta_preview["doc"]["reason"]:
             st.caption(meta_preview["doc"]["reason"])
 
-        st.markdown("**Sheets raw preview（先頭20行）**")
+        st.markdown("**Sheets raw preview（先頭シート20行）**")
         raw_preview = meta_preview["sheet"].get("raw_preview", [])
         if raw_preview:
             st.dataframe(pd.DataFrame(raw_preview))
